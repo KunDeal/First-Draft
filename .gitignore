@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Project specific
+vector_db/
+knowledge_base/
+logs/
+output.txt
+*.log
