@@ -7,6 +7,7 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 import docx
 import fitz  # PyMuPDF
+import pandas as pd  # Excel support
 from dotenv import load_dotenv
 import time
 import gc
@@ -32,6 +33,7 @@ def setup_logging():
     )
 
 if __name__ == "__main__":
+    print("DEBUG: Script started")
     setup_logging()
 
 def get_file_hash(filepath):
@@ -73,6 +75,34 @@ def read_pdf(filepath):
         logging.error(error_msg)
         return None
 
+def read_excel(filepath):
+    """Extract text from a .xlsx file, converting each row to text."""
+    try:
+        # Read Excel file
+        df = pd.read_excel(filepath)
+        
+        # Convert to string, handling NaNs
+        text_content = []
+        
+        # Iterate over rows
+        for index, row in df.iterrows():
+            row_text = []
+            for col in df.columns:
+                val = row[col]
+                if pd.notna(val):  # Skip empty cells
+                    row_text.append(f"{col}: {val}")
+            
+            if row_text:
+                # Join cells in a row with ", " and rows with newline
+                text_content.append(" | ".join(row_text))
+        
+        return "\n".join(text_content)
+    except Exception as e:
+        error_msg = f"Error reading Excel {filepath}: {e}"
+        print(error_msg)
+        logging.error(error_msg)
+        return None
+
 def recursive_split_text(text, chunk_size, chunk_overlap):
     """Split text recursively respecting separators."""
     if not text:
@@ -101,9 +131,15 @@ def recursive_split_text(text, chunk_size, chunk_overlap):
             split_point = end
         
         chunks.append(text[start:split_point])
-        start = split_point - chunk_overlap
-        if start >= split_point: 
-             start = split_point
+        
+        # Calculate next start
+        next_start = split_point - chunk_overlap
+        
+        # Prevent infinite loops: ensure we always move forward
+        if next_start <= start:
+            next_start = split_point
+            
+        start = next_start
         
         if start < 0: start = 0
         
@@ -114,6 +150,7 @@ def ingest_documents():
     gc.collect()
     
     # Initialize ChromaDB
+    print("DEBUG: Initializing ChromaDB")
     try:
         # ChromaDB client is lightweight
         chroma_client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
@@ -217,10 +254,32 @@ def ingest_documents():
                     
                     del pages
 
+            elif filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls"):
+                text = read_excel(filepath)
+                if text is None:
+                    continue
+                if text:
+                    raw_chunks = recursive_split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+                    del text
+                    
+                    for idx, chunk in enumerate(raw_chunks):
+                        chunks_to_add.append(chunk)
+                        metadatas_to_add.append({
+                            "filename": filename,
+                            "page_number": 1, # Excel treated as single page
+                            "upload_date": datetime.datetime.now().isoformat(),
+                            "file_hash": file_hash,
+                            "chunk_index": idx
+                        })
+                        ids_to_add.append(f"{file_hash}_{idx}")
+                    
+                    del raw_chunks
+
             # 3. Embed and Add (Only if we have chunks)
             if chunks_to_add:
                 # CRITICAL: Use batch_size=4 to prevent RAM spikes during embedding
-                embeddings = model.encode(chunks_to_add, batch_size=4).tolist()
+                # Enable progress bar to show activity on large files
+                embeddings = model.encode(chunks_to_add, batch_size=4, show_progress_bar=True).tolist()
                 
                 collection.add(
                     documents=chunks_to_add,
