@@ -1,0 +1,7 @@
+{
+  "steps": [
+    "model=intfloat/multilingual-e5-small"
+  ],
+  "exception": "[Errno 2] No such file or directory: 'C:\\\\Users\\\\ivank\\\\.cache\\\\huggingface\\\\hub\\\\models--intfloat--multilingual-e5-small\\\\snapshots\\\\c007d7ef6fd86656326059b28395a7a03a7c5846\\\\.\\\\modules.json'",
+  "traceback": "Traceback (most recent call last):\n  File \"C:\\Users\\ivank\\Desktop\\Мой новый проект\\quick_add.py\", line 9, in <module>\n    model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=\"cpu\")\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\ivank\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\sentence_transformers\\SentenceTransformer.py\", line 327, in __init__\n    modules, self.module_kwargs = self._load_sbert_model(\n                                  ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\ivank\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\sentence_transformers\\SentenceTransformer.py\", line 2244, in _load_sbert_model\n    with open(modules_json_path, encoding=\"utf8\") as fIn:\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nFileNotFoundError: [Errno 2] No such file or directory: 'C:\\\\Users\\\\ivank\\\\.cache\\\\huggingface\\\\hub\\\\models--intfloat--multilingual-e5-small\\\\snapshots\\\\c007d7ef6fd86656326059b28395a7a03a7c5846\\\\.\\\\modules.json'\n"
+}

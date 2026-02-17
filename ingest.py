@@ -1,312 +1,412 @@
 import os
 import hashlib
-import datetime
+import re
 import logging
 import chromadb
-from chromadb.config import Settings
+import json
+import shutil
 from sentence_transformers import SentenceTransformer
 import docx
 import fitz  # PyMuPDF
-import pandas as pd  # Excel support
+import pandas as pd
 from dotenv import load_dotenv
-import time
 import gc
 
-# Load environment variables
 load_dotenv()
 
-# Configuration - Golden Settings for 8GB RAM
 KNOWLEDGE_BASE_DIR = "knowledge_base"
 VECTOR_DB_DIR = "vector_db"
+DOC_STORE_DIR = "doc_store"
 LOGS_DIR = "logs"
-CHUNK_SIZE = 800       # Reduced from 1500
-CHUNK_OVERLAP = 200    # Reduced from 250
-EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-base"
+MODELS_DIR = "models"
 
-# Setup logging - Minimal mode
-def setup_logging():
-    # Only log errors to file, keep console clean
-    logging.basicConfig(
-        filename=os.path.join(LOGS_DIR, "ingest.log"),
-        level=logging.ERROR, 
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+PARENT_CHUNK_SIZE = 3000
+CHILD_CHUNK_SIZE = 800
+CHUNK_OVERLAP = 150
+EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
+COLLECTION_NAME = "legal_rag"
 
-if __name__ == "__main__":
-    print("DEBUG: Script started")
-    setup_logging()
+os.makedirs(LOGS_DIR, exist_ok=True)
+logging.basicConfig(
+    filename=os.path.join(LOGS_DIR, "ingest.log"),
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-def get_file_hash(filepath):
-    """Calculate MD5 hash of a file to detect changes."""
-    hash_md5 = hashlib.md5()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+def reset_databases():
+    os.makedirs(VECTOR_DB_DIR, exist_ok=True)
+    os.makedirs(DOC_STORE_DIR, exist_ok=True)
+
+
+def get_doc_id(filename):
+    return hashlib.md5(filename.encode("utf-8")).hexdigest()
+
 
 def read_docx(filepath):
-    """Extract text from a .docx file."""
     try:
         doc = docx.Document(filepath)
-        full_text = []
-        for para in doc.paragraphs:
-            full_text.append(para.text)
-        return "\n".join(full_text)
+        return "\n".join(p.text for p in doc.paragraphs)
     except Exception as e:
-        error_msg = f"Error reading DOCX {filepath}: {e}"
-        print(error_msg)
-        logging.error(error_msg)
+        logging.error(f"Error reading DOCX {filepath}: {e}")
         return None
+
 
 def read_pdf(filepath):
-    """Extract text from a .pdf file with page numbers."""
     try:
         doc = fitz.open(filepath)
-        pages_content = []
-        for page_num, page in enumerate(doc):
-            text = page.get_text()
-            if text.strip():
-                pages_content.append({"text": text, "page": page_num + 1})
+        parts = []
+        for page in doc:
+            parts.append(page.get_text())
         doc.close()
-        return pages_content
+        return "\n".join(parts)
     except Exception as e:
-        error_msg = f"Error reading PDF {filepath}: {e}"
-        print(error_msg)
-        logging.error(error_msg)
+        logging.error(f"Error reading PDF {filepath}: {e}")
         return None
+
 
 def read_excel(filepath):
-    """Extract text from a .xlsx file, converting each row to text."""
     try:
-        # Read Excel file
         df = pd.read_excel(filepath)
-        
-        # Convert to string, handling NaNs
-        text_content = []
-        
-        # Iterate over rows
-        for index, row in df.iterrows():
-            row_text = []
+        rows = []
+        for _, row in df.iterrows():
+            parts = []
             for col in df.columns:
-                val = row[col]
-                if pd.notna(val):  # Skip empty cells
-                    row_text.append(f"{col}: {val}")
-            
-            if row_text:
-                # Join cells in a row with ", " and rows with newline
-                text_content.append(" | ".join(row_text))
-        
-        return "\n".join(text_content)
+                value = row[col]
+                if pd.notna(value):
+                    parts.append(f"{col}: {value}")
+            if parts:
+                rows.append(" | ".join(parts))
+        return "\n".join(rows)
     except Exception as e:
-        error_msg = f"Error reading Excel {filepath}: {e}"
-        print(error_msg)
-        logging.error(error_msg)
+        logging.error(f"Error reading Excel {filepath}: {e}")
         return None
 
-def recursive_split_text(text, chunk_size, chunk_overlap):
-    """Split text recursively respecting separators."""
+
+def recursive_split(text, chunk_size, overlap):
     if not text:
         return []
-    
     chunks = []
     start = 0
     text_len = len(text)
-    
     while start < text_len:
-        end = start + chunk_size
-        if end >= text_len:
+        end = min(start + chunk_size, text_len)
+        if end == text_len:
             chunks.append(text[start:])
             break
-        
-        # Try to find a split point (newline, space)
         split_point = -1
-        # Prioritize separators in order: Paragraphs > Lines > Sentences > Words
-        for separator in ["\n\n", "\n", ". ", " "]:
-            last_sep = text.rfind(separator, start, end)
-            if last_sep != -1 and last_sep > start:
-                split_point = last_sep + len(separator)
+        search_start = max(start, end - int(chunk_size * 0.2))
+        for sep in ["\n\n", "\n", ". ", " "]:
+            candidate = text.rfind(sep, search_start, end)
+            if candidate != -1:
+                split_point = candidate + len(sep)
                 break
-        
         if split_point == -1:
             split_point = end
-        
         chunks.append(text[start:split_point])
-        
-        # Calculate next start
-        next_start = split_point - chunk_overlap
-        
-        # Prevent infinite loops: ensure we always move forward
+        next_start = split_point - overlap
         if next_start <= start:
-            next_start = split_point
-            
-        start = next_start
-        
-        if start < 0: start = 0
-        
+            next_start = start + chunk_size - overlap
+        start = max(start + 1, next_start)
     return chunks
 
-def ingest_documents():
-    # Force garbage collection at start
-    gc.collect()
-    
-    # Initialize ChromaDB
-    print("DEBUG: Initializing ChromaDB")
-    try:
-        # ChromaDB client is lightweight
-        chroma_client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
-        collection = chroma_client.get_or_create_collection(name="legal_rag")
-    except Exception as e:
-        logging.error(f"Failed to initialize ChromaDB: {e}")
+
+def save_parent_to_store(doc_id, part_index, text, filename):
+    parent_id = f"{doc_id}_{part_index}"
+    file_path = os.path.join(DOC_STORE_DIR, f"{parent_id}.json")
+    payload = {
+        "parent_id": parent_id,
+        "doc_id": doc_id,
+        "part_index": part_index,
+        "filename": filename,
+        "text": text,
+    }
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return parent_id
+
+
+def sanitize_metadata(metadata):
+    clean = {}
+    for k, v in metadata.items():
+        if v is None:
+            if k.startswith("is_"):
+                clean[k] = False
+            elif "index" in k or "parts" in k:
+                clean[k] = -1
+            else:
+                clean[k] = ""
+        else:
+            clean[k] = v
+    return clean
+
+
+def load_embedding_model():
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    local_dir = os.path.join(MODELS_DIR, "e5-small")
+    if not os.path.isdir(local_dir) or not os.listdir(local_dir):
+        logging.error(f"Local embedding model not found or empty: {local_dir}")
+        raise RuntimeError(f"Local embedding model not found: {local_dir}")
+    model = SentenceTransformer(local_dir, device="cpu")
+    return model
+
+
+def is_gk4_filename(filename):
+    lower = filename.lower()
+    return "гражданский кодекс российской федерации" in lower and "часть четвертая" in lower
+
+
+def split_gk4_into_articles(text):
+    articles = []
+    pattern = re.compile(r"(?m)^(Статья\s+(\d+[.\d]*)\..*?)\s*$")
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return articles
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        heading = match.group(1)
+        number = match.group(2)
+        body = text[start:end].strip()
+        articles.append((number, body))
+    return articles
+
+
+def split_gk4_article_children(article_text):
+    lines = article_text.splitlines()
+    chunks = []
+    current = []
+    paragraph_re = re.compile(r"^\s*(\d+(\.\d+)*)\.\s+")
+    for line in lines:
+        if paragraph_re.match(line):
+            if current:
+                chunks.append("\n".join(current).strip())
+                current = []
+        current.append(line)
+    if current:
+        chunks.append("\n".join(current).strip())
+    cleaned = [c for c in chunks if c]
+    if not cleaned:
+        cleaned = recursive_split(article_text, CHILD_CHUNK_SIZE, CHUNK_OVERLAP)
+    return cleaned
+
+
+def ingest_gk_only():
+    logging.info("Starting GK4 ingestion into separate collection 'legal_gk'")
+    if not os.path.exists(KNOWLEDGE_BASE_DIR):
+        logging.error(f"{KNOWLEDGE_BASE_DIR} not found")
         return
 
-    # Initialize Embedding Model on CPU
-    try:
-        model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cpu')
-    except Exception as e:
-        logging.error(f"Failed to load embedding model: {e}")
-        return
+    client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+    collection = client.get_or_create_collection(name="legal_gk")
 
-    # Optimization: existing hashes check
-    existing_hashes = set()
+    existing_files = set()
     try:
         existing_data = collection.get(include=["metadatas"])
-        if existing_data["metadatas"]:
-            for meta in existing_data["metadatas"]:
-                if meta and "file_hash" in meta:
-                    existing_hashes.add(meta["file_hash"])
-        
-        del existing_data
-        gc.collect()
+        for meta in existing_data.get("metadatas", []):
+            if meta and "filename" in meta:
+                existing_files.add(meta["filename"])
     except Exception as e:
-        logging.error(f"Error reading existing DB: {e}")
+        logging.error(f"Error reading existing metadata for GK: {e}")
 
+    model = load_embedding_model()
+
+    for filename in os.listdir(KNOWLEDGE_BASE_DIR):
+        if not is_gk4_filename(filename):
+            continue
+
+        if filename in existing_files:
+            logging.info(f"Skipping already indexed GK4 file: {filename}")
+            continue
+
+        filepath = os.path.join(KNOWLEDGE_BASE_DIR, filename)
+        if not os.path.isfile(filepath):
+            continue
+
+        logging.info(f"Processing GK4 file: {filename}")
+
+        text = None
+        lower = filename.lower()
+        if lower.endswith(".pdf"):
+            text = read_pdf(filepath)
+        elif lower.endswith(".docx"):
+            text = read_docx(filepath)
+        elif lower.endswith(".xlsx") or lower.endswith(".xls"):
+            text = read_excel(filepath)
+
+        if not text:
+            logging.error(f"No text extracted from {filename}, skipping")
+            continue
+
+        doc_id = get_doc_id(filename)
+
+        articles = split_gk4_into_articles(text)
+        if not articles:
+            logging.warning(
+                f"{filename}: GK4 detection failed, falling back to generic splitting"
+            )
+            parent_chunks = recursive_split(text, PARENT_CHUNK_SIZE, CHUNK_OVERLAP)
+            total_parents = len(parent_chunks)
+            total_children = 0
+            for p_index, p_text in enumerate(parent_chunks):
+                parent_id = save_parent_to_store(doc_id, p_index, p_text, filename)
+                child_chunks = recursive_split(
+                    p_text, CHILD_CHUNK_SIZE, CHUNK_OVERLAP
+                )
+                for c_index, c_text in enumerate(child_chunks):
+                    child_id = f"{parent_id}_c{c_index}"
+                    metadata = {
+                        "parent_id": parent_id,
+                        "doc_id": doc_id,
+                        "filename": filename,
+                        "part_index": p_index,
+                        "total_parts": total_parents,
+                        "page_content": c_text,
+                    }
+                    clean_meta = sanitize_metadata(metadata)
+                    embedding = model.encode(c_text).tolist()
+                    collection.add(
+                        ids=[child_id],
+                        embeddings=[embedding],
+                        metadatas=[clean_meta],
+                        documents=[c_text],
+                    )
+                    total_children += 1
+            logging.info(
+                f"{filename}: finished GK4 fallback parents={total_parents}, children={total_children}"
+            )
+            gc.collect()
+            continue
+
+        total_parents = len(articles)
+        logging.info(f"{filename}: GK4 mode, articles={total_parents}")
+        total_children = 0
+        for p_index, (article_number, article_text) in enumerate(articles):
+            parent_id = save_parent_to_store(doc_id, p_index, article_text, filename)
+            child_chunks = split_gk4_article_children(article_text)
+            logging.info(
+                f"{filename}: article {article_number} ({p_index + 1}/{total_parents}) children={len(child_chunks)}"
+            )
+            for c_index, c_text in enumerate(child_chunks):
+                child_id = f"{parent_id}_c{c_index}"
+                metadata = {
+                    "parent_id": parent_id,
+                    "doc_id": doc_id,
+                    "filename": filename,
+                    "part_index": p_index,
+                    "total_parts": total_parents,
+                    "page_content": c_text,
+                    "article_number": article_number,
+                }
+                clean_meta = sanitize_metadata(metadata)
+                embedding = model.encode(c_text).tolist()
+                collection.add(
+                    ids=[child_id],
+                    embeddings=[embedding],
+                    metadatas=[clean_meta],
+                    documents=[c_text],
+                )
+                total_children += 1
+        logging.info(
+            f"{filename}: finished GK4 articles={total_parents}, children={total_children}"
+        )
+        gc.collect()
+
+
+def ingest_documents():
+    logging.info("Starting ingestion")
     if not os.path.exists(KNOWLEDGE_BASE_DIR):
-        os.makedirs(KNOWLEDGE_BASE_DIR)
-        logging.error(f"Knowledge base directory not found created: {KNOWLEDGE_BASE_DIR}")
+        logging.error(f"{KNOWLEDGE_BASE_DIR} not found")
         return
 
-    all_files = [f for f in os.listdir(KNOWLEDGE_BASE_DIR) if os.path.isfile(os.path.join(KNOWLEDGE_BASE_DIR, f))]
-    total_files = len(all_files)
-    
-    print(f"Starting ingestion of {total_files} files in Stable/Low-RAM mode...")
-    print(f"Settings: Chunk={CHUNK_SIZE}, Overlap={CHUNK_OVERLAP}, Batch=4")
+    client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+    collection = client.get_or_create_collection(name=COLLECTION_NAME)
 
-    # Strict 1-by-1 Processing
-    for i, filename in enumerate(all_files):
+    existing_files = set()
+    try:
+        existing_data = collection.get(include=["metadatas"])
+        for meta in existing_data.get("metadatas", []):
+            if meta and "filename" in meta:
+                existing_files.add(meta["filename"])
+    except Exception as e:
+        logging.error(f"Error reading existing metadata: {e}")
+
+    model = load_embedding_model()
+
+    for filename in os.listdir(KNOWLEDGE_BASE_DIR):
+        if is_gk4_filename(filename):
+            logging.info(f"Skipping GK4 file in main collection: {filename}")
+            continue
+
+        if filename in existing_files:
+            logging.info(f"Skipping already indexed file: {filename}")
+            continue
+
         filepath = os.path.join(KNOWLEDGE_BASE_DIR, filename)
-        
-        try:
-            # 1. Check Hash
-            file_hash = get_file_hash(filepath)
-            if file_hash in existing_hashes:
-                print(f"[{i+1}/{total_files}] Skipping {filename} (already indexed)")
-                continue
+        if not os.path.isfile(filepath):
+            continue
 
-            chunks_to_add = []
-            metadatas_to_add = []
-            ids_to_add = []
-            
-            # 2. Read and Chunk
-            if filename.lower().endswith(".docx"):
-                text = read_docx(filepath)
-                if text is None:
-                    continue # Error already printed
-                if text:
-                    raw_chunks = recursive_split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
-                    del text # Clear full text
-                    
-                    for idx, chunk in enumerate(raw_chunks):
-                        chunks_to_add.append(chunk)
-                        metadatas_to_add.append({
-                            "filename": filename,
-                            "page_number": 1,
-                            "upload_date": datetime.datetime.now().isoformat(),
-                            "file_hash": file_hash,
-                            "chunk_index": idx
-                        })
-                        ids_to_add.append(f"{file_hash}_{idx}")
-                    
-                    del raw_chunks
+        logging.info(f"Processing file: {filename}")
 
-            elif filename.lower().endswith(".pdf"):
-                pages = read_pdf(filepath)
-                if pages is None:
-                    continue # Error already printed
-                if pages:
-                    chunk_counter = 0
-                    for page_data in pages:
-                        page_text = page_data["text"]
-                        page_num = page_data["page"]
-                        
-                        raw_chunks = recursive_split_text(page_text, CHUNK_SIZE, CHUNK_OVERLAP)
-                        
-                        for chunk in raw_chunks:
-                            chunks_to_add.append(chunk)
-                            metadatas_to_add.append({
-                                "filename": filename,
-                                "page_number": page_num,
-                                "upload_date": datetime.datetime.now().isoformat(),
-                                "file_hash": file_hash,
-                                "chunk_index": chunk_counter
-                            })
-                            ids_to_add.append(f"{file_hash}_{chunk_counter}")
-                            chunk_counter += 1
-                    
-                    del pages
+        text = None
+        lower = filename.lower()
+        if lower.endswith(".pdf"):
+            text = read_pdf(filepath)
+        elif lower.endswith(".docx"):
+            text = read_docx(filepath)
+        elif lower.endswith(".xlsx") or lower.endswith(".xls"):
+            text = read_excel(filepath)
 
-            elif filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls"):
-                text = read_excel(filepath)
-                if text is None:
-                    continue
-                if text:
-                    raw_chunks = recursive_split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
-                    del text
-                    
-                    for idx, chunk in enumerate(raw_chunks):
-                        chunks_to_add.append(chunk)
-                        metadatas_to_add.append({
-                            "filename": filename,
-                            "page_number": 1, # Excel treated as single page
-                            "upload_date": datetime.datetime.now().isoformat(),
-                            "file_hash": file_hash,
-                            "chunk_index": idx
-                        })
-                        ids_to_add.append(f"{file_hash}_{idx}")
-                    
-                    del raw_chunks
+        if not text:
+            logging.error(f"No text extracted from {filename}, skipping")
+            continue
 
-            # 3. Embed and Add (Only if we have chunks)
-            if chunks_to_add:
-                # CRITICAL: Use batch_size=4 to prevent RAM spikes during embedding
-                # Enable progress bar to show activity on large files
-                embeddings = model.encode(chunks_to_add, batch_size=4, show_progress_bar=True).tolist()
-                
+        doc_id = get_doc_id(filename)
+
+        parent_chunks = recursive_split(text, PARENT_CHUNK_SIZE, CHUNK_OVERLAP)
+        total_parents = len(parent_chunks)
+        logging.info(f"{filename}: parent chunks={total_parents}")
+
+        total_children = 0
+
+        for p_index, p_text in enumerate(parent_chunks):
+            parent_id = save_parent_to_store(doc_id, p_index, p_text, filename)
+
+            child_chunks = recursive_split(p_text, CHILD_CHUNK_SIZE, CHUNK_OVERLAP)
+            logging.info(
+                f"{filename}: parent {p_index + 1}/{total_parents} children={len(child_chunks)}"
+            )
+
+            for c_index, c_text in enumerate(child_chunks):
+                child_id = f"{parent_id}_c{c_index}"
+                metadata = {
+                    "parent_id": parent_id,
+                    "doc_id": doc_id,
+                    "filename": filename,
+                    "part_index": p_index,
+                    "total_parts": total_parents,
+                    "page_content": c_text,
+                    "prev_parent_id": f"{doc_id}_{p_index - 1}" if p_index > 0 else None,
+                    "next_parent_id": f"{doc_id}_{p_index + 1}"
+                    if p_index < total_parents - 1
+                    else None,
+                }
+                clean_meta = sanitize_metadata(metadata)
+                embedding = model.encode(c_text).tolist()
                 collection.add(
-                    documents=chunks_to_add,
-                    embeddings=embeddings,
-                    metadatas=metadatas_to_add,
-                    ids=ids_to_add
+                    ids=[child_id],
+                    embeddings=[embedding],
+                    metadatas=[clean_meta],
+                    documents=[c_text],
                 )
-                
-                print(f"[{i+1}/{total_files}] Indexed {filename} ({len(chunks_to_add)} chunks)")
-                
-                # 4. Explicit cleanup
-                del chunks_to_add
-                del metadatas_to_add
-                del ids_to_add
-                del embeddings
-            else:
-                 print(f"[{i+1}/{total_files}] Skipped {filename} (no text found)")
+                total_children += 1
 
-        except Exception as e:
-            logging.error(f"Error processing {filename}: {e}")
-            print(f"[{i+1}/{total_files}] Error on {filename}: {e}")
-        
-        # 5. Garbage Collection after EVERY file
+        logging.info(
+            f"{filename}: finished parents={total_parents}, children={total_children}"
+        )
         gc.collect()
-        time.sleep(0.1) # Brief pause to let system settle
-        
-    print("Ingestion complete.")
+
+    logging.info("Ingestion complete")
+
 
 if __name__ == "__main__":
     ingest_documents()
